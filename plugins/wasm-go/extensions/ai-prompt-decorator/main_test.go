@@ -588,6 +588,23 @@ var replaceInvalidRegexConfig = func() json.RawMessage {
 	return data
 }()
 
+// 测试配置：移除 Claude Code 注入到 Anthropic system blocks 的动态 billing header。
+var replaceClaudeCodeBillingHeaderConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"prepend": []map[string]interface{}{},
+		"append":  []map[string]interface{}{},
+		"replace": []map[string]interface{}{
+			{
+				"on_role":     "system",
+				"pattern":     `(?s)^\s*x-anthropic-billing-header:\s*cc_version=[^;]+;\s*cc_entrypoint=[^;]+;\s*cch=[0-9a-fA-F]{5};?\s*$`,
+				"replacement": "",
+				"regex":       true,
+			},
+		},
+	})
+	return data
+}()
+
 func TestReplaceRules(t *testing.T) {
 	test.RunTest(t, func(t *testing.T) {
 		// 测试 replace 规则按 role 与正则生效
@@ -668,6 +685,51 @@ func TestReplaceRules(t *testing.T) {
 			require.Equal(t, "You are running inside agent.", messages[0].(map[string]interface{})["content"])
 			require.Equal(t, "agent is great", messages[1].(map[string]interface{})["content"])
 			require.Equal(t, "Mention agent if needed.", messages[2].(map[string]interface{})["content"])
+
+			host.CompleteHttp()
+		})
+
+		// 测试 Anthropic 顶层 system blocks 中的 Claude Code 动态 billing header 会被删除，
+		// 使后续稳定 system prompt 成为可缓存前缀。
+		t.Run("replace removes Claude Code billing header from Anthropic system blocks", func(t *testing.T) {
+			host, status := test.NewTestHost(replaceClaudeCodeBillingHeaderConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/messages"},
+				{":method", "POST"},
+			})
+
+			body := `{
+				"model": "claude-opus-4-6",
+				"system": [
+					{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.37.fbe; cc_entrypoint=cli; cch=a112b;"},
+					{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+					{"type": "text", "text": "Stable system prompt", "cache_control": {"type": "ephemeral"}}
+				],
+				"messages": [
+					{"role": "user", "content": "Hello"}
+				]
+			}`
+			action := host.CallOnHttpRequestBody([]byte(body))
+			require.Equal(t, types.ActionContinue, action)
+
+			modifiedBody := host.GetRequestBody()
+			require.NotEmpty(t, modifiedBody)
+
+			systemBlocks := gjson.GetBytes(modifiedBody, "system").Array()
+			require.Len(t, systemBlocks, 2)
+			require.Equal(t, "You are Claude Code, Anthropic's official CLI for Claude.", systemBlocks[0].Get("text").String())
+			require.Equal(t, "Stable system prompt", systemBlocks[1].Get("text").String())
+			require.NotContains(t, string(modifiedBody), "x-anthropic-billing-header")
+			require.NotContains(t, string(modifiedBody), "cc_version=")
+			require.NotContains(t, string(modifiedBody), "cch=")
+
+			messages := gjson.GetBytes(modifiedBody, "messages").Array()
+			require.Len(t, messages, 1)
+			require.Equal(t, "Hello", messages[0].Get("content").String())
 
 			host.CompleteHttp()
 		})

@@ -39,8 +39,9 @@ replace rule 配置说明：
 
 说明：
 
-- `replace` 规则会对最终拼装出的 `messages` 数组（`prepend` + 原始 message + `append`）按声明顺序依次应用，便于多个规则叠加。
+- `replace` 规则会对最终拼装出的 `messages` 数组（`prepend` + 原始 message + `append`）按声明顺序依次应用，便于多个规则叠加；如果请求包含 Anthropic 风格的顶层 `system` 字符串或 `system` 文本块数组，也会按 `system` role 应用同一组规则。
 - 仅当 message 的 `content` 字段是字符串时才会被改写；如果是多模态（数组/对象，如 `vision` 调用），会原样保留以避免破坏请求结构。
+- 对 Anthropic `system` 文本块数组，若某个文本块被规则替换为空白内容，该文本块会被移除，适合清理动态 attribution / billing 文本以提升缓存命中率。
 - `pattern` 不允许为空；`regex: true` 时如果正则编译失败，插件加载会直接失败，避免运行期出错。
 
 ## 示例
@@ -149,6 +150,26 @@ curl http://localhost/test \
 
 - 第 1 条规则限定 `on_role: system`，所以 `user` 消息里的 `OpenClaw` 不会被改；
 - 第 2 条规则没设 `on_role`，对任意 role 的 `content` 都生效，因此 `secret-1234` 被脱敏成 `[REDACTED]`。
+
+### 清理 Claude Code billing header 以提升缓存命中率
+
+Claude Code 部分版本会在 Anthropic 请求的顶层 `system` 文本块中插入如下动态内容：
+
+```text
+x-anthropic-billing-header: cc_version=2.1.37.fbe; cc_entrypoint=cli; cch=a112b;
+```
+
+其中 `cc_version` 后缀和 `cch` 会随请求变化，容易破坏按 prompt 前缀匹配的缓存。可以用以下 `replace` 规则将该文本块清理掉：
+
+```yaml
+replace:
+- on_role: system
+  pattern: "(?s)^\\s*x-anthropic-billing-header:\\s*cc_version=[^;]+;\\s*cc_entrypoint=[^;]+;\\s*cch=[0-9a-fA-F]{5};?\\s*$"
+  replacement: ""
+  regex: true
+```
+
+如果该规则把 Anthropic `system` 数组中的某个 `text` 文本块替换为空，插件会直接移除该文本块，让后续稳定的 system prompt 成为更容易命中的缓存前缀。
 
 ## 基于geo-ip插件的能力，扩展AI提示词装饰器插件携带用户地理位置信息
 如果需要在LLM的请求前后加入用户地理位置信息，请确保同时开启geo-ip插件和AI提示词装饰器插件。并且在相同的请求处理阶段里，geo-ip插件的优先级必须高于AI提示词装饰器插件。首先geo-ip插件会根据用户ip计算出用户的地理位置信息，然后通过请求属性传递给后续插件。比如在默认阶段里，geo-ip插件的priority配置1000，ai-prompt-decorator插件的priority配置500。

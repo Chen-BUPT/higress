@@ -33,8 +33,9 @@ Replace rule configuration description:
 
 Notes:
 
-- `replace` rules run against the **final** assembled `messages` array (`prepend` + original messages + `append`) in declaration order, so multiple rules compose predictably.
+- `replace` rules run against the **final** assembled `messages` array (`prepend` + original messages + `append`) in declaration order, so multiple rules compose predictably. If the request contains an Anthropic-style top-level `system` string or `system` text block array, the same rules are also applied with the `system` role.
 - A message is rewritten only when its `content` is a plain string. Multimodal `content` (arrays/objects, e.g. vision payloads) is left untouched to preserve the request structure.
+- For Anthropic `system` text block arrays, a text block that becomes blank after replacement is removed. This is useful for stripping dynamic attribution or billing text so prompt-prefix caches can hit more often.
 - `pattern` must not be empty. If `regex: true` and the pattern fails to compile, plugin start-up fails fast instead of erroring at request time.
 
 ## Example
@@ -138,6 +139,26 @@ Notes:
 
 - The first rule is gated on `on_role: system`, so the `OpenClaw` mention inside the user message is left as-is.
 - The second rule has no `on_role`, so it applies to messages of any role and rewrites `secret-1234` to `[REDACTED]`.
+
+### Stripping the Claude Code billing header to improve cache hit rate
+
+Some Claude Code versions inject dynamic metadata like the following into Anthropic top-level `system` text blocks:
+
+```text
+x-anthropic-billing-header: cc_version=2.1.37.fbe; cc_entrypoint=cli; cch=a112b;
+```
+
+The `cc_version` suffix and `cch` value can change between requests, which may break prompt-prefix cache matching. Use this `replace` rule to strip the block:
+
+```yaml
+replace:
+- on_role: system
+  pattern: "(?s)^\\s*x-anthropic-billing-header:\\s*cc_version=[^;]+;\\s*cc_entrypoint=[^;]+;\\s*cch=[0-9a-fA-F]{5};?\\s*$"
+  replacement: ""
+  regex: true
+```
+
+When this rule rewrites an Anthropic `system` array `text` block to blank, the plugin removes that block so the following stable system prompt becomes the cacheable prefix.
 
 ## Based on the geo-ip plugin's capabilities, extend AI Prompt Decorator plugin to carry user geographic location information.
 If you need to include user geographic location information before and after the LLM's requests, please ensure both the geo-ip plugin and the AI Prompt Decorator plugin are enabled. Moreover, in the same request processing phase, the geo-ip plugin's priority must be higher than that of the AI Prompt Decorator plugin. First, the geo-ip plugin will calculate the user's geographic location information based on the user's IP, and then pass it to subsequent plugins via request attributes. For instance, in the default phase, the geo-ip plugin's priority configuration is 1000, while the ai-prompt-decorator plugin's priority configuration is 500.

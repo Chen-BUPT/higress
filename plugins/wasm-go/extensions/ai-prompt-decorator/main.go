@@ -148,6 +148,59 @@ func applyReplaceRulesToMessage(rawMessage string, rules []ReplaceRule) string {
 	return out
 }
 
+// applyReplaceRulesToSystem rewrites Anthropic-style top-level "system"
+// prompts. The field may be either a plain string or an array of content
+// blocks; text blocks that become empty after replacement are dropped so
+// dynamic attribution-only blocks do not remain in the cache prefix.
+func applyReplaceRulesToSystem(rawSystem string, rules []ReplaceRule) string {
+	if len(rules) == 0 {
+		return rawSystem
+	}
+	systemResult := gjson.Parse(rawSystem)
+	switch systemResult.Type {
+	case gjson.String:
+		original := systemResult.String()
+		updated := applyReplaceRulesToContent("system", original, rules)
+		if updated == original {
+			return rawSystem
+		}
+		out, err := json.Marshal(updated)
+		if err != nil {
+			log.Errorf("Failed to apply replace rules to system prompt, error: %v", err)
+			return rawSystem
+		}
+		return string(out)
+	case gjson.JSON:
+		if !systemResult.IsArray() {
+			return rawSystem
+		}
+		systemJSON := `{"system":[]}`
+		for _, block := range systemResult.Array() {
+			rewritten := block.Raw
+			textResult := block.Get("text")
+			if textResult.Type == gjson.String {
+				original := textResult.String()
+				updated := applyReplaceRulesToContent("system", original, rules)
+				if updated != original {
+					if strings.TrimSpace(updated) == "" {
+						continue
+					}
+					out, err := sjson.Set(block.Raw, "text", updated)
+					if err != nil {
+						log.Errorf("Failed to apply replace rules to system block, error: %v", err)
+					} else {
+						rewritten = out
+					}
+				}
+			}
+			systemJSON, _ = sjson.SetRaw(systemJSON, "system.-1", rewritten)
+		}
+		return gjson.Get(systemJSON, "system").Raw
+	default:
+		return rawSystem
+	}
+}
+
 func onHttpRequestBody(ctx wrapper.HttpContext, config AIPromptDecoratorConfig, body []byte) types.Action {
 	messageJson := `{"messages":[]}`
 
@@ -196,6 +249,16 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIPromptDecoratorConfig, 
 	newbody, err := sjson.SetRaw(string(body), "messages", gjson.Get(messageJson, "messages").Raw)
 	if err != nil {
 		log.Error("modify body failed")
+	}
+	rawSystem := gjson.Get(newbody, "system")
+	if rawSystem.Exists() {
+		rewrittenSystem := applyReplaceRulesToSystem(rawSystem.Raw, config.Replace)
+		if rewrittenSystem != rawSystem.Raw {
+			newbody, err = sjson.SetRaw(newbody, "system", rewrittenSystem)
+			if err != nil {
+				log.Error("modify system prompt failed")
+			}
+		}
 	}
 	if err = proxywasm.ReplaceHttpRequestBody([]byte(newbody)); err != nil {
 		log.Error("rewrite body failed")
